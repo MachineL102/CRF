@@ -17,7 +17,7 @@
 ## 关于为什么要实现算法
 * 目前好用的machine learning库均来源于国外(sklearn, tensorflow, pytorch)，自主研发警告。
 * 引用一段话（知乎发现的）
-Quora上对于Yoshua Bengio的最新访谈，关于一个问题（看大佬是怎么说的）：
+Quora上对于Yoshua Bengio的最新访谈，关于一个问题（看巨佬是怎么说的）：
 对于进入机器学习领域的年轻研究人员，你有什么建议？（What advise do you have for young researchers entering the field of Machine Learning?）他回答到：Make sure you have a strong training in math and computer science (including the practical part, i.e., programming). Read books and (lots of) papers but that is not enough: you need to develop your intuitions by (a) programming a bunch of learning algorithms yourself, e.g., trying to reproduce existing papers, and (b) by learning to tune hyper-parameters and explore variants (in architecture, objective function, etc.), e.g., by participating in competitions or trying to improve on published results once you have been able to reproduce them. Then, find collaborators with whom you can brainstorm about ideas and share the workload involved in exploring and testing new ideas.  Working with an existing group is ideal, of course, or recruit your own students to work on this with you, if you are a faculty.
 <br>划重点---扎实的数学和计算机能力（包括实践---编程）
 
