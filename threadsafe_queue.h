@@ -42,13 +42,13 @@ public:
 
 	// 如果队列为空，将一直等待，直到有数据弹出
 	std::unique_ptr<node> wait_pop_head() {
-		std::unique_lock<std::mutex> head_lock(wait_and_pop());
+		std::unique_lock<std::mutex> head_lock(wait_for_data());
 		return pop_head();
 	}
 
 	// 重载版本，可赋值
 	std::unique_ptr<node> wait_pop_head(T& value) {
-		std::unique_lock<std::mutex> head_lock(wait_and_pop());
+		std::unique_lock<std::mutex> head_lock(wait_for_data());
 		value = std::move(*head->data); 
 		return pop_head();
 	}
@@ -75,12 +75,12 @@ public:
 public:
 
 	std::shared_ptr<T> wait_and_pop() {
-		std::unique_ptr<node> cosnt old_head = wait_pop_head();
-		return old_head;
+		std::unique_ptr<node> old_head = wait_pop_head();
+		return old_head->data;
 	}
 
 	void wait_and_pop(T& value) {
-		std::unique_ptr<node> cosnt old_head = wait_pop_head(value);
+		std::unique_ptr<node> old_head = wait_pop_head(value);
 	}
 
 	std::shared_ptr<T> try_pop(T& value) {
@@ -95,7 +95,7 @@ public:
 
 	void push(T new_value) {
 		std::shared_ptr<T> new_data(std::make_shared<T>(std::move(new_value)));
-		std::unique_lock<node> p(new node); // 将空指针放在队列尾，将队列尾原来的空指针指向new_data
+		std::unique_ptr<node> p(new node); // 将空指针放在队列尾，将队列尾原来的空指针指向new_data
 		{
 			std::lock_guard<std::mutex> tail_lock(tail_mutex);
 			tail->data = new_data;

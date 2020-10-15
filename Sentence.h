@@ -8,6 +8,10 @@
 #include <sstream>
 #include "node.h"
 #include "path.h"
+#include "threadsafe_map.h"
+#include <atomic>
+
+std::mutex expected_mutex;
 
 //	2043ms	2059ms
 void split(const std::string& s, std::vector<std::string>& sv, const char flag = ' ') {
@@ -46,21 +50,23 @@ std::string split(const std::string& s, size_t i, const char flag = ' ') {
 	return "";
 }
 
+std::vector<std::mutex> mutexes(8);
+
 class Sentence {
 private:
 	int x_size = 0;
 	double Z_ = 0.0;
-	std::vector<std::string> lines;
 	std::vector<std::vector<int>>  feature_index;	// 每个单词20个特征索引，即在几万个特征中满足20个特征
 	std::vector<std::vector<Node*>> node_;
 	std::vector<std::vector<Path*>> path_;
 	std::vector<int> result_;
 	double cost_; //  viterbi最优序列的损失
 public:
+	std::vector<std::string> lines;
 	std::vector<int> answer_;
-	static int index;
+	static std::atomic<int> index;
 	static int y_size;
-	static std::map <std::string, std::pair<int, unsigned int> > dict_;
+	static threadsafe_map<std::string, int> dict_;
 	static int total_feature;
 
 	int eval() {
@@ -73,7 +79,7 @@ public:
 		return err;
 	}
 
-	void viterbi() {
+	bool viterbi() {
 		for (int i = 0; i < x_size; ++i) {
 			for (int j = 0; j < y_size; ++j) {
 				double bestc = -1e37;
@@ -108,8 +114,10 @@ public:
 		}
 
 		cost_ = -node_[x_size - 1][result_[x_size - 1]]->bestCost;
+		return true;
 	}
 
+	// 并行计算且不想存在数据竞争，所以每个线程创建副本而不能&expected
 	double calcGradient(std::vector<double>& expected, std::vector<double>& weights) {
 		double s = 0;
 		for (int i = 0; i < x_size; ++i) { //遍历每一个节点的，遍历计算每个节点和每条边上的特征函数，计算每个特征函数的期望
@@ -138,7 +146,7 @@ public:
 		return Z_ - s;
 	}
 
-	void buildGraph() {
+	bool buildGraph() {
 		for (int i = 0; i < x_size; i++) {
 			node_.push_back(std::vector<Node*>());
 			for (int j = 0; j < y_size; j++) {
@@ -161,9 +169,11 @@ public:
 				}
 			}
 		}
+		return true;
 	};
 
-	void dp(std::vector<double>& weights) {
+	bool dp_and_calcGradient_and_viterbi(std::vector<double>& weights, std::vector<double> expected, 
+		std::vector<double>& shared_expected, double lr) {
 		for (auto v_path : path_) {
 			for (auto path : v_path) {
 				path->calccost(weights, y_size);
@@ -187,6 +197,30 @@ public:
 			// Z_：ψ(x)=β(s0)=∑s1ψ(∗,s1)β(s1)
 			Z_ = logsumexp(Z_, node_[0][j]->beta, j == 0);
 		}
+		calcGradient(expected, weights);
+		viterbi();
+		std::vector<int> done(8);
+		int frequency = 0;
+
+		while (frequency != 8) {
+			for (int i = 0; i < done.size(); i++) {
+				if (done[i] == 0) {
+					if (mutexes[i].try_lock()) {
+						size_t start = weights.size() / 8 * i;
+						size_t end = weights.size() / 8 * (i + 1);
+						if (i == done.size() - 1) end = weights.size();
+						for (size_t j = start; j < end; j++) {
+							shared_expected[j] += lr * expected[j];
+						}
+						mutexes[i].unlock();
+						frequency++;
+						done[i] = 1;
+					}
+				}
+			}
+		}
+
+		return true;
 	}
 
 	// 是否真的没有调用复制构造，修改源码
@@ -197,12 +231,11 @@ public:
 	}
 
 	// input：shared
-	void buildFeature(std::vector<std::string>& unigram_templs, std::vector<std::string>& bigram_templs) {
+	bool buildFeature(std::vector<std::string>& unigram_templs, std::vector<std::string>& bigram_templs) {
 		std::string seq = ",";
 		std::vector<int> feature;
 		for (size_t i = 0; i < lines.size(); i++) {
 			for (std::vector<std::string>::const_iterator it = unigram_templs.begin(); it != unigram_templs.end(); ++it) {
-
 				// 在U05:%x[-1,0]/%x[0,0] 中找 ","
 				std::string::const_iterator seq_it = std::find_first_of((*it).begin(), (*it).end(), seq.begin(), seq.end());
 
@@ -224,21 +257,19 @@ public:
 				}
 				
 				// shared
-				std::map <std::string, std::pair<int, unsigned int> >::iterator dic_it = dict_.find(key);
-				if (dic_it == dict_.end()) {
-					dict_[key] = {index, 1};
+				int find_result = dict_.value_for(key, -1);
+				if (find_result == -1) {
+					dict_.add_or_update_mapping(key, index);
 					feature.push_back(index);
 					index += (key[0] == 'U' ? y_size : y_size * y_size);;
 				}
 				else {
-					dict_[key].second++;
-					feature.push_back(dict_[key].first);
+					feature.push_back(find_result);
 				}
 			}
 			feature_index.push_back(feature);
 			feature.clear();
 		}
-		
 		for (size_t i = 0; i < lines.size(); i++) {
 			for (std::vector<std::string>::const_iterator it = bigram_templs.begin(); it != bigram_templs.end(); ++it) {
 				std::string::const_iterator seq_it = std::find_first_of((*it).begin(), (*it).end(), seq.begin(), seq.end());
@@ -249,22 +280,20 @@ public:
 				if (*(seq_it - 2) == '-') x = -x;
 				std::string key = templsToKey(i, x, y, *it);
 
-				std::map <std::string, std::pair<int, unsigned int> >::iterator dic_it = dict_.find(key);
-				if (dic_it == dict_.end()) {
-					dict_[key] = { index, 1 };
+				int find_result = dict_.value_for(key, -1);
+				if (find_result == -1) {
+					dict_.add_or_update_mapping(key, index);
 					feature.push_back(index);
 					index += (key[0] == 'U' ? y_size : y_size * y_size);;
 				}
 				else {
-					dict_[key].second++;
-					feature.push_back(dict_[key].first);
+					feature.push_back(find_result);
 				}
 			}
 			feature_index.push_back(feature);
 			feature.clear();
 		}
-		
-		total_feature = index;
+		return true;
 	}
 
 	std::string templsToKey(int i, int x, int y, std::string templs_string) {
@@ -288,7 +317,7 @@ public:
 	int& getX_size() { return x_size; }
 };
 
-int Sentence::index = 0;
-int Sentence::y_size;
+std::atomic<int> Sentence::index = 0;
+int Sentence::y_size = 3; // !!!
 int Sentence::total_feature;
-std::map <std::string, std::pair<int, unsigned int> > Sentence::dict_;
+threadsafe_map<std::string, int> Sentence::dict_;

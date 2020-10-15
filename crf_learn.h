@@ -9,6 +9,9 @@
 #include "Sentence.h"
 #include "node.h"
 #include "path.h"
+#include "threadpool.h"
+
+std::mutex labels_mutex;
 
 class Param {
 public:
@@ -59,6 +62,22 @@ bool openTemplate(const char* filename, std::vector<std::string>& unigram_templs
     return true;
 }
 
+bool open_triandata_task(Sentence* sentence, std::set<std::string>* labels, 
+    std::vector<std::string>& unigram_templs, std::vector<std::string>& bigram_templs) {
+    std::string tmp;
+    for (auto line : sentence->lines) {
+        auto index = line.find_last_of(" ");
+        tmp = line.substr(index + 1);
+        {
+            std::lock_guard<std::mutex> guard(labels_mutex);
+            labels->insert(tmp);
+        }
+        sentence->answer_.emplace_back(std::distance(labels->begin(), labels->find(tmp)));
+    }
+    sentence->buildFeature(unigram_templs, bigram_templs);
+    return true;
+}
+
 bool openTrain(const char* filename, std::vector<Sentence*>& x) {
     std::ifstream ifs(filename);
     std::string line;
@@ -71,7 +90,6 @@ bool openTrain(const char* filename, std::vector<Sentence*>& x) {
     
     // shared
     int y_size = 0;
-    std::string seq = "\t";
 
     // thread_local
     std::vector<std::string> v;
@@ -84,25 +102,15 @@ bool openTrain(const char* filename, std::vector<Sentence*>& x) {
             cur_sentence = new Sentence();
             continue;
         }
-        split(line, v, ' ');
         cur_sentence->push_back(line);
-        // labels：shared
-        labels.insert(v.back()); 
-        int tmp = std::distance(labels.begin(), labels.find(v.back())); //  应该把begin放在前面，++find
-        cur_sentence->answer_.push_back(tmp);
-        v.clear();
-    }
-    y_.clear(); 
-    for (std::set<std::string>::iterator it = labels.begin();
-        it != labels.end(); ++it) {
-        y_.push_back(*it);
     }
 
     // y_size：shared
-    cur_sentence -> getY_size() = labels.size();
+    
     ifs.close();
     return true;
 }
+
 
 int crf_learn(int argc, char** argv) {
 
@@ -119,7 +127,7 @@ int crf_learn(int argc, char** argv) {
 
 
     std::string* templs = new std::string;
-    // thread_local
+    // x:shared    Sentence:thread_local
     std::vector<Sentence*> x;   // x作为自动变量是在栈中，其中的元素Sentence*是在堆中
 
     // shared
@@ -132,50 +140,75 @@ int crf_learn(int argc, char** argv) {
     if(!openTemplate(template_file, unigram_templs, bigram_templs, templs)) std::cout << template_file << "read error" << std::endl;
     if(!openTrain(train_file, x))  std::cout << template_file << "read error" << std::endl;
 
-    // thread_local
-    for (size_t cur_sentence = 0; cur_sentence < x.size(); ++cur_sentence) {
-        std::vector<int> feature;
-        x[cur_sentence]->buildFeature(unigram_templs, bigram_templs);
+    std::set<std::string> labels; // set放所有的标签集合【B， I， O】
+    
+    std::threadpool tp(8);
+    std::vector<std::future<bool>> future_bool;
+    for (auto s_ptr : x) {
+        // 设置 answer和lines  然后设置feature_index
+        future_bool.emplace_back(tp.commit(open_triandata_task, s_ptr, &labels, unigram_templs, bigram_templs));
     }
-
-    int feature_total = Sentence().getFeatureTotal();
-
+    
+    // 此处需要所有的 x 都执行完 任务才可以 getFeatureTotal， 即线程池中空闲线程数量 == 所有线程数量
+    for (int i = 0; i < x.size(); i++) {
+        future_bool[i].get();
+    }// 主线程会阻塞，直到所有任务执行完毕
+    
     // shared
-    std::vector<double> weights(feature_total);
-    std::vector<double> expected(feature_total);
+    std::vector<double> weights(Sentence::index);
+    std::vector<double> shared_expected(Sentence::index);
 
     int num_err = 0;
     double obj = 0.0;
-    double lr = 1;
+    double lr = 0.1;
     bool orthant = false;
     int num_example = 0;
     int i = 0;
 
     // thread_local
-    for (Sentence* s : x) {
-        s->buildGraph();    // 设置每个Node的数据
+    future_bool.clear();
+    for (auto s_ptr : x) {
+        // 设置 answer和lines  然后设置feature_index
+        future_bool.emplace_back(tp.commit(std::bind(&Sentence::buildGraph, s_ptr)));
     }
-    while (i++ < 1000) {
-        for (Sentence* s : x) {
-            // 只读shared
-            s->dp(weights);    // 计算M，alpha，beta，Z_全局归一化常数
-            // 只读shared
-            obj += s->calcGradient(expected, weights);
-            s->viterbi();
-            int error_num = s->eval();
-            num_example += s->getX_size();
+    for (int i = 0; i < x.size(); i++) {
+        future_bool[i].get();
+    }// 主线程会阻塞，直到所有任务执行完毕
+    future_bool.clear();
+
+    std::vector<std::future<double>> future_double;
+    while (i++ < 10000) {
+        for (Sentence* s_ptr : x) {
+            // weights：共享只读， expected：不共享，每个线程创造副本
+            future_bool.emplace_back(tp.commit(std::bind(&Sentence::dp_and_calcGradient_and_viterbi, 
+                s_ptr, weights, shared_expected, std::ref(shared_expected), lr)));
+            // int error_num = s_ptr->eval(); 由于异步计算并没有完成，所以这里不能eval()
+        }
+
+        // 等带所有异步任务完成进行评估和梯度汇总
+        for (int i = 0; i < x.size(); i++) {
+            future_bool[i].get();
+        }// 主线程会阻塞，直到所有任务执行完毕
+        future_bool.clear();
+
+        // 评估
+        for (Sentence* s_ptr : x) {
+            int error_num = s_ptr->eval();
+            num_example += s_ptr->getX_size();
             num_err += error_num;
         }
-        for (size_t i = 0; i < feature_total; i++) {
-            // 可写shared
-            weights[i] -= lr * expected[i];
-            expected[i] = 0;
+
+        // 梯度汇总
+        for (size_t i = 0; i < Sentence::index; i++) {
+            weights[i] -= lr * shared_expected[i];
+            shared_expected[i] = 0;
         }
+
         double need_del = (double)num_err / num_example;
         std::cout << need_del << std::endl;
     }
 
-    std::cout << "expected" << expected[0] << expected[1000] << std::endl;
+    std::cout << "expected" << shared_expected[0] << shared_expected[1000] << std::endl;
 
     return 0;
 }
