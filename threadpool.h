@@ -43,7 +43,7 @@ namespace std
 			}
 		}
 
-		// 将任务加入task_但并不一定执行
+		// 将任务加入task_但并不一定立即执行
 		template<class F, class... Args>
 		auto commit(F&& f, Args&&... args) ->future<decltype(f(args...))>
 		{
@@ -51,7 +51,6 @@ namespace std
 				throw runtime_error("commit on ThreadPool is stopped.");
 
 			using RetType = decltype(f(args...)); // typename std::result_of<F(Args...)>::type, 函数 f 的返回值类型
-			packaged_task<RetType()> a = bind(forward<F>(f), forward<Args>(args)...);
 			auto task = make_shared<packaged_task<RetType()>>(
 				bind(forward<F>(f), forward<Args>(args)...)	// forward：防止临时对象的右值引用被当作左值来处理
 				); // 把函数入口及参数,打包(绑定)
@@ -70,7 +69,7 @@ namespace std
 
 			return future;
 		}
-		
+
 		int idlCount() { return _idlThrNum; }
 		int thrCount() { return _pool.size(); }
 #ifndef THREADPOOL_AUTO_GROW
